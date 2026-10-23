@@ -1,0 +1,233 @@
+import { timingSafeEqual } from "node:crypto";
+import { neon } from "@neondatabase/serverless";
+import { NextResponse } from "next/server";
+import { getPayPalOrder } from "@/lib/paypal";
+
+function authorized(request: Request): boolean {
+  const expected = process.env.CAPTUREGUARD_INTERNAL_TOKEN;
+  const supplied = request.headers.get("authorization")?.replace(/^Bearer\s+/i, "");
+  if (!expected || !supplied) return false;
+
+  const a = Buffer.from(expected);
+  const b = Buffer.from(supplied);
+  return a.length === b.length && timingSafeEqual(a, b);
+}
+
+function validId(id: string): boolean {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(id);
+}
+
+type PayPalOrderSnapshot = {
+  status?: string;
+  purchase_units?: Array<{
+    payments?: {
+      captures?: Array<{
+        id?: string;
+        status?: string;
+      }>;
+    };
+  }>;
+};
+
+function completedCapture(order: PayPalOrderSnapshot) {
+  for (const unit of order?.purchase_units ?? []) {
+    for (const capture of unit?.payments?.captures ?? []) {
+      if (capture?.status === "COMPLETED" && typeof capture.id === "string") {
+        return capture;
+      }
+    }
+  }
+  return null;
+}
+
+export async function POST(
+  request: Request,
+  context: { params: Promise<{ id: string }> },
+) {
+  if (!process.env.CAPTUREGUARD_INTERNAL_TOKEN) {
+    return NextResponse.json({ error: "Internal authentication is not configured." }, { status: 503 });
+  }
+  if (!authorized(request)) {
+    return NextResponse.json({ error: "Unauthorized." }, { status: 401 });
+  }
+
+  const { id } = await context.params;
+  if (!validId(id)) {
+    return NextResponse.json({ error: "Invalid operation ID." }, { status: 400 });
+  }
+  if (!process.env.DATABASE_URL) {
+    return NextResponse.json({ error: "Database is not configured." }, { status: 503 });
+  }
+
+  const sql = neon(process.env.DATABASE_URL);
+
+  try {
+    const rows = await sql`
+      SELECT id, status, paypal_order_id, paypal_capture_id, version
+      FROM payment_operations
+      WHERE id = ${id}::uuid
+      LIMIT 1
+    `;
+
+    if (!rows.length) {
+      return NextResponse.json({ error: "Operation not found." }, { status: 404 });
+    }
+
+    const operation = rows[0];
+
+    if (!operation.paypal_order_id) {
+      return NextResponse.json({
+        ok: false,
+        status: operation.status,
+        code: "PROVIDER_ORDER_ID_MISSING",
+        action: "Keep this operation blocked and investigate the original request using provider-side records. Do not retry blindly.",
+      }, { status: 409 });
+    }
+
+    if (operation.status === "succeeded" && operation.paypal_capture_id) {
+      return NextResponse.json({
+        ok: true,
+        replayed: true,
+        operation: { id, status: operation.status, paypalCaptureId: operation.paypal_capture_id },
+      });
+    }
+
+    let order: PayPalOrderSnapshot;
+    try {
+      order = await getPayPalOrder(String(operation.paypal_order_id));
+    } catch {
+      return NextResponse.json({
+        ok: false,
+        status: operation.status,
+        code: "PROVIDER_LOOKUP_UNAVAILABLE",
+        action: "Retry reconciliation later. Do not submit another payment request.",
+      }, { status: 503 });
+    }
+
+    const capture = completedCapture(order);
+
+    if (order?.status === "COMPLETED" && capture) {
+      const saved = await sql`
+        WITH changed AS (
+          UPDATE payment_operations
+          SET status = 'succeeded',
+              paypal_capture_id = ${capture.id},
+              provider_status = 'COMPLETED',
+              last_error_code = NULL,
+              version = version + 1,
+              updated_at = NOW()
+          WHERE id = ${id}::uuid
+            AND paypal_order_id = ${String(operation.paypal_order_id)}
+            AND status IN ('awaiting_approval', 'outcome_unknown', 'reconciliation_required', 'request_in_flight')
+            AND (paypal_capture_id IS NULL OR paypal_capture_id = ${capture.id})
+          RETURNING id, status, version
+        ),
+        inserted AS (
+          INSERT INTO payment_events (
+            operation_id, sequence_no, event_type,
+            from_status, to_status, source, metadata
+          )
+          SELECT id, version + 1, 'provider_confirmed_success',
+                 ${String(operation.status)}, 'succeeded', 'paypal',
+                 jsonb_build_object(
+                   'paypalOrderId', CAST(${String(operation.paypal_order_id)} AS text),
+                   'paypalCaptureId', ${capture.id},
+                   'providerStatus', 'COMPLETED',
+                   'reconciled', true
+                 )
+          FROM changed
+          RETURNING operation_id
+        )
+        SELECT changed.id, changed.status
+        FROM changed
+        JOIN inserted ON inserted.operation_id = changed.id
+      `;
+
+      if (!saved.length) {
+        return NextResponse.json({
+          error: "PayPal reports a completed capture, but the database state changed concurrently. Manual reconciliation is required.",
+          code: "RECONCILIATION_PERSISTENCE_CONFLICT",
+        }, { status: 409 });
+      }
+
+      return NextResponse.json({
+        ok: true,
+        operation: { id, status: "succeeded", paypalCaptureId: capture.id },
+        providerStatus: "COMPLETED",
+      });
+    }
+
+    const checked = await sql`
+      WITH changed AS (
+        UPDATE payment_operations
+        SET status = CASE
+              WHEN status = 'request_in_flight' THEN 'outcome_unknown'
+              ELSE status
+            END,
+            provider_status = ${typeof order?.status === "string" ? order.status : "UNKNOWN"},
+            last_error_code = CASE
+              WHEN status = 'request_in_flight' THEN 'PAYPAL_CAPTURE_OUTCOME_UNKNOWN'
+              ELSE last_error_code
+            END,
+            version = version + 1,
+            updated_at = NOW()
+        WHERE id = ${id}::uuid
+          AND paypal_order_id = ${String(operation.paypal_order_id)}
+          AND status = ${String(operation.status)}
+          AND status IN ('awaiting_approval', 'outcome_unknown', 'reconciliation_required', 'request_in_flight', 'failed')
+        RETURNING id, status, version
+      ),
+      inserted AS (
+        INSERT INTO payment_events (
+          operation_id, sequence_no, event_type,
+          from_status, to_status, source, metadata
+        )
+        SELECT id, version + 1, 'reconciliation_checked',
+               ${String(operation.status)}, status, 'paypal',
+               jsonb_build_object(
+                 'paypalOrderId', CAST(${String(operation.paypal_order_id)} AS text),
+                 'providerStatus', CAST(${typeof order?.status === "string" ? order.status : "UNKNOWN"} AS text),
+                 'captureFound', ${Boolean(capture)}::boolean
+               )
+        FROM changed
+        RETURNING operation_id
+      )
+      SELECT changed.id, changed.status
+      FROM changed
+      JOIN inserted ON inserted.operation_id = changed.id
+    `;
+
+    if (!checked.length) {
+      return NextResponse.json({
+        error: "Operation changed during reconciliation. Fetch its latest state before continuing.",
+        code: "RECONCILIATION_CONFLICT",
+      }, { status: 409 });
+    }
+
+    return NextResponse.json({
+      ok: true,
+      reconciled: true,
+      operation: { id, status: checked[0].status },
+      providerStatus: typeof order?.status === "string" ? order.status : "UNKNOWN",
+      captureConfirmed: false,
+      action: "No completed capture was confirmed. The operation remains non-successful; review provider state before any further action.",
+    });
+  } catch (error) {
+    const diagnostic = error instanceof Error ? error.message : "Unknown error";
+    console.error("Reconciliation failed:", diagnostic);
+
+    return NextResponse.json(
+      {
+        error: "Reconciliation could not be completed.",
+        ...(process.env.NODE_ENV !== "production"
+          ? { diagnostic }
+          : {}),
+      },
+      { status: 503 },
+    );
+  }
+}
+
+
+
+

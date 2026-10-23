@@ -39,3 +39,15 @@ yarn-error.log*
 # typescript
 *.tsbuildinfo
 next-env.d.ts
+.neon
+
+# Local IDE files
+.vs/
+
+# Temporary backups and generated archives
+*.bak
+*.zip
+*.before-collage-*
+page.tsx.backup-*
+frontend-backup-*/
+frontend-check/

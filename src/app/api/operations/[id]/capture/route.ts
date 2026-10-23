@@ -1,0 +1,343 @@
+import { timingSafeEqual } from "node:crypto";
+import { neon } from "@neondatabase/serverless";
+import { NextResponse } from "next/server";
+import {
+  capturePayPalOrder,
+  getPayPalAccessToken,
+  getPayPalOrder,
+} from "@/lib/paypal";
+
+function authorized(request: Request): boolean {
+  const expected = process.env.CAPTUREGUARD_INTERNAL_TOKEN;
+  const supplied = request.headers.get("authorization")?.replace(/^Bearer\s+/i, "");
+  if (!expected || !supplied) return false;
+  const a = Buffer.from(expected);
+  const b = Buffer.from(supplied);
+  return a.length === b.length && timingSafeEqual(a, b);
+}
+
+function validId(id: string): boolean {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i.test(id);
+}
+
+type PayPalOrderSnapshot = {
+  status?: string;
+  purchase_units?: Array<{
+    payments?: {
+      captures?: Array<{
+        id?: string;
+        status?: string;
+      }>;
+    };
+  }>;
+};
+
+function completedCapture(order: PayPalOrderSnapshot) {
+  for (const unit of order?.purchase_units ?? []) {
+    for (const capture of unit?.payments?.captures ?? []) {
+      if (capture?.status === "COMPLETED" && typeof capture.id === "string") {
+        return capture;
+      }
+    }
+  }
+  return null;
+}
+
+export async function POST(
+  request: Request,
+  context: { params: Promise<{ id: string }> },
+) {
+  if (!process.env.CAPTUREGUARD_INTERNAL_TOKEN) {
+    return NextResponse.json({ error: "Internal API authentication is not configured." }, { status: 503 });
+  }
+  if (!authorized(request)) {
+    return NextResponse.json({ error: "Unauthorized." }, { status: 401 });
+  }
+
+  const { id } = await context.params;
+  if (!validId(id)) {
+    return NextResponse.json({ error: "Invalid operation ID." }, { status: 400 });
+  }
+  if (!process.env.DATABASE_URL) {
+    return NextResponse.json({ error: "Database is not configured." }, { status: 503 });
+  }
+
+  const sql = neon(process.env.DATABASE_URL);
+
+  try {
+    const rows = await sql`
+      SELECT id, status, currency, paypal_order_id, paypal_capture_id,
+             amount_minor, version
+      FROM payment_operations
+      WHERE id = ${id}::uuid
+      LIMIT 1
+    `;
+
+    if (!rows.length) {
+      return NextResponse.json({ error: "Operation not found." }, { status: 404 });
+    }
+
+    const operation = rows[0];
+
+    if (operation.status === "succeeded" && operation.paypal_capture_id) {
+      return NextResponse.json({
+        ok: true,
+        replayed: true,
+        operation: { id, status: "succeeded", paypalCaptureId: operation.paypal_capture_id },
+      });
+    }
+
+    if (operation.status !== "awaiting_approval" || !operation.paypal_order_id) {
+      return NextResponse.json({
+        error: "Operation is not eligible for capture.",
+        operation: { id, status: operation.status },
+        action: "Reconcile uncertain operations before any retry.",
+      }, { status: 409 });
+    }
+
+    if (operation.currency !== "USD") {
+      return NextResponse.json({ error: "Capture currently supports USD only." }, { status: 422 });
+    }
+
+    // Read the provider's current state before attempting capture.
+    let providerOrder: PayPalOrderSnapshot;
+    try {
+      providerOrder = await getPayPalOrder(String(operation.paypal_order_id));
+    } catch {
+      return NextResponse.json({
+        error: "Could not verify the PayPal order status.",
+        code: "PAYPAL_ORDER_STATUS_UNKNOWN",
+        action: "Retry status reconciliation later; do not initiate capture yet.",
+      }, { status: 503 });
+    }
+
+    // A completed capture may already exist after a prior uncertain attempt.
+    // Persist the provider-confirmed result instead of capturing again.
+    const alreadyCaptured = completedCapture(providerOrder);
+    if (providerOrder?.status === "COMPLETED" && alreadyCaptured) {
+      const saved = await sql`
+        WITH changed AS (
+          UPDATE payment_operations
+          SET status = 'succeeded',
+              paypal_capture_id = ${alreadyCaptured.id},
+              provider_status = 'COMPLETED',
+              last_error_code = NULL,
+              version = version + 1,
+              updated_at = NOW()
+          WHERE id = ${id}::uuid
+            AND status IN ('awaiting_approval', 'outcome_unknown', 'reconciliation_required', 'request_in_flight')
+            AND paypal_order_id = ${String(operation.paypal_order_id)}
+          RETURNING id, version
+        )
+        INSERT INTO payment_events (
+          operation_id, sequence_no, event_type,
+          from_status, to_status, source, metadata
+        )
+        SELECT id, version + 1, 'provider_confirmed_success',
+               'awaiting_approval', 'succeeded', 'paypal',
+               jsonb_build_object(
+                 'paypalOrderId', ${String(operation.paypal_order_id)},
+                 'paypalCaptureId', ${alreadyCaptured.id},
+                 'providerStatus', 'COMPLETED',
+                 'recoveredFromProviderLookup', true
+               )
+        FROM changed
+        RETURNING operation_id
+      `;
+
+      if (!saved.length) {
+        return NextResponse.json({
+          error: "Provider confirms completion, but the database update needs reconciliation.",
+          code: "CAPTURE_PERSISTENCE_UNCERTAIN",
+        }, { status: 503 });
+      }
+
+      return NextResponse.json({
+        ok: true,
+        replayed: true,
+        operation: { id, status: "succeeded", paypalCaptureId: alreadyCaptured.id },
+      });
+    }
+
+    if (providerOrder?.status !== "APPROVED") {
+      return NextResponse.json({
+        error: "PayPal has not confirmed that this order is approved for capture.",
+        code: "PAYPAL_ORDER_NOT_APPROVED",
+        providerStatus: typeof providerOrder?.status === "string" ? providerOrder.status : "UNKNOWN",
+        action: "Wait for payer approval or reconcile the order status.",
+      }, { status: 409 });
+    }
+
+    let accessToken: string;
+    try {
+      accessToken = (await getPayPalAccessToken()).accessToken;
+    } catch {
+      return NextResponse.json({
+        error: "Could not authenticate with PayPal Sandbox.",
+        code: "PAYPAL_AUTHENTICATION_FAILED",
+      }, { status: 503 });
+    }
+
+    // Atomically claim the operation before calling the external capture API.
+    const claimed = await sql`
+      WITH changed AS (
+        UPDATE payment_operations
+        SET status = 'request_in_flight',
+            version = version + 1,
+            updated_at = NOW()
+        WHERE id = ${id}::uuid
+          AND status = 'awaiting_approval'
+          AND paypal_order_id = ${String(operation.paypal_order_id)}
+          AND paypal_capture_id IS NULL
+        RETURNING id, version
+      )
+      INSERT INTO payment_events (
+        operation_id, sequence_no, event_type,
+        from_status, to_status, source, metadata
+      )
+      SELECT id, version + 1, 'capture_request_started',
+             'awaiting_approval', 'request_in_flight', 'system',
+             jsonb_build_object('paypalOrderId', ${String(operation.paypal_order_id)})
+      FROM changed
+      RETURNING operation_id
+    `;
+
+    if (!claimed.length) {
+      return NextResponse.json({
+        error: "Another request changed or claimed this operation.",
+        action: "Read the operation state before proceeding.",
+      }, { status: 409 });
+    }
+
+    let result;
+    try {
+      // Use a stable operation UUID as the capture idempotency key.
+      result = await capturePayPalOrder({
+        accessToken,
+        orderId: String(operation.paypal_order_id),
+        requestId: id,
+      });
+    } catch {
+      // The capture may have succeeded at PayPal despite a timeout.
+      // Keep it non-terminal and block another capture attempt.
+      try {
+        await sql`
+          WITH changed AS (
+            UPDATE payment_operations
+            SET status = 'outcome_unknown',
+                last_error_code = 'PAYPAL_CAPTURE_OUTCOME_UNKNOWN',
+                version = version + 1,
+                updated_at = NOW()
+            WHERE id = ${id}::uuid
+              AND status = 'request_in_flight'
+            RETURNING id, version
+          )
+          INSERT INTO payment_events (
+            operation_id, sequence_no, event_type,
+            from_status, to_status, source, metadata
+          )
+          SELECT id, version + 1, 'provider_outcome_unknown',
+                 'request_in_flight', 'outcome_unknown', 'system',
+                 jsonb_build_object('reason', 'capture_response_unconfirmed')
+          FROM changed
+        `;
+      } catch {
+        // An in-flight operation still blocks another capture request.
+      }
+
+      return NextResponse.json({
+        error: "PayPal did not confirm the capture result.",
+        code: "PAYPAL_CAPTURE_OUTCOME_UNKNOWN",
+        action: "Reconcile PayPal's order and capture state before any retry.",
+      }, { status: 202 });
+    }
+
+    const capture = completedCapture(result);
+    if (result.status !== "COMPLETED" || !capture) {
+      // A non-completed response is not proof of payment success.
+      try {
+        await sql`
+          WITH changed AS (
+            UPDATE payment_operations
+            SET status = 'outcome_unknown',
+                provider_status = ${typeof result.status === "string" ? result.status : "UNKNOWN"},
+                last_error_code = 'PAYPAL_CAPTURE_NOT_CONFIRMED',
+                version = version + 1,
+                updated_at = NOW()
+            WHERE id = ${id}::uuid
+              AND status = 'request_in_flight'
+            RETURNING id, version
+          )
+          INSERT INTO payment_events (
+            operation_id, sequence_no, event_type,
+            from_status, to_status, source, metadata
+          )
+          SELECT id, version + 1, 'provider_outcome_unknown',
+                 'request_in_flight', 'outcome_unknown', 'paypal',
+                 jsonb_build_object('providerStatus', ${typeof result.status === "string" ? result.status : "UNKNOWN"})
+          FROM changed
+        `;
+      } catch {
+        // Leave the operation blocked if persistence fails.
+      }
+
+      return NextResponse.json({
+        error: "PayPal did not return a confirmed completed capture.",
+        code: "PAYPAL_CAPTURE_NOT_CONFIRMED",
+        action: "Reconcile the provider state before further action.",
+      }, { status: 202 });
+    }
+
+    const saved = await sql`
+      WITH changed AS (
+        UPDATE payment_operations
+        SET status = 'succeeded',
+            paypal_capture_id = ${capture.id},
+            provider_status = 'COMPLETED',
+            last_error_code = NULL,
+            version = version + 1,
+            updated_at = NOW()
+        WHERE id = ${id}::uuid
+          AND status = 'request_in_flight'
+          AND paypal_order_id = ${String(operation.paypal_order_id)}
+          AND paypal_capture_id IS NULL
+        RETURNING id, version
+      )
+      INSERT INTO payment_events (
+        operation_id, sequence_no, event_type,
+        from_status, to_status, source, metadata
+      )
+      SELECT id, version + 1, 'provider_confirmed_success',
+             'request_in_flight', 'succeeded', 'paypal',
+             jsonb_build_object(
+               'paypalOrderId', ${String(operation.paypal_order_id)},
+               'paypalCaptureId', ${capture.id},
+               'providerStatus', 'COMPLETED'
+             )
+      FROM changed
+      RETURNING operation_id
+    `;
+
+    if (!saved.length) {
+      // PayPal has confirmed success, but persistence was not confirmed.
+      // Never issue another capture request in this situation.
+      return NextResponse.json({
+        error: "PayPal confirms capture, but persistence is uncertain.",
+        code: "CAPTURE_PERSISTENCE_UNCERTAIN",
+        paypalCaptureId: capture.id,
+        action: "Reconcile the operation against PayPal before proceeding.",
+      }, { status: 503 });
+    }
+
+    return NextResponse.json({
+      ok: true,
+      replayed: false,
+      sandbox: true,
+      operation: { id, status: "succeeded", paypalCaptureId: capture.id },
+    });
+  } catch (error) {
+    console.error("PayPal capture endpoint failed:", error instanceof Error ? error.message : "Unknown error");
+    return NextResponse.json({ error: "Could not process the capture request." }, { status: 503 });
+  }
+}
+
