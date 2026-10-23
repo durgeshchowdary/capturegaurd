@@ -51,3 +51,14 @@ next-env.d.ts
 page.tsx.backup-*
 frontend-backup-*/
 frontend-check/
+
+# Local IDE files
+.vs/
+
+# Temporary archives and backups
+*.zip
+*.bak
+*.before-collage-*
+page.tsx.backup-*
+frontend-backup-*/
+frontend-check/
